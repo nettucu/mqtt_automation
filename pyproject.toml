@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "mqtt-automation"
+version = "0.1.0"
+description = ""
+authors = ["Catalin Trifu <ctrifu@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+typer = "^0.15.1"
+rich = "^13.9.4"
+paho-mqtt = "^2.1.0"
+loguru = "^0.7.3"
+python-daemon = "^3.1.2"
+python-dotenv = "^1.0.1"
+python-decouple = "^3.8"
+python-dateutil = "^2.9.0.post0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+mqtt-automation = "mqtt_automation.cli:app"
