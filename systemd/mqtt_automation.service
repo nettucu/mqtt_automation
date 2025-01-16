@@ -1,0 +1,13 @@
+[Unit]
+Description=MQTT Automation Service
+After=network.target mosquitto.service
+Requires=mosquitto.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/mqtt_automation
+ExecStart=/usr/bin/poetry run python mqtt_automation/cli.py start
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
