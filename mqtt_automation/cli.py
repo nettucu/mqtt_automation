@@ -1,16 +1,15 @@
 import ast
 import re
 import signal
+import selectors
 import socket
 import sys
 import threading
 import time
-from queue import Queue
+from queue import Queue, ShutDown
 from pathlib import Path
 from typing import Annotated, Any
 
-import daemon
-import daemon.pidfile
 import paho.mqtt.client as mqtt
 import typer
 from dateutil import parser
@@ -39,11 +38,14 @@ OUTPUTS = {
 }
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-MONITOR_OUTPUTS_STATE = True
-MONITOR_OUTPUTS_STATE_THREAD_STARTED = False
-LOG_FILE_DESCRIPTOR = None
 
+RETRY_LIMIT = 5
+
+monitor_thread_started: threading.Event = threading.Event()
+shutdown_event: threading.Event = threading.Event()
 output_state_queue = Queue()
+selector = selectors.DefaultSelector()
+
 app = typer.Typer()
 
 
@@ -58,16 +60,16 @@ class MQTTLogConfig:
 
     def __init__(self, daemonize: bool = False) -> None:
         self.is_daemon = daemonize
-        self.log_level_console = config("LOG_LEVEL_CONSOLE", default="INFO")
-        self.log_level_file = config("LOG_LEVEL_FILE", default="INFO")
-        self.log_file_rotation = config("LOG_ROTATION", default="10 MB")
-        self.log_file = Path(f"{BASE_DIR}/log") / config("LOG_FILE")
+        self.log_level_console: str = config("LOG_LEVEL_CONSOLE", default="INFO")
+        self.log_level_file: str = config("LOG_LEVEL_FILE", default="INFO")
+        self.log_file_rotation: str = config("LOG_ROTATION", default="10 MB")
+        self.log_file: Path = Path(f"{BASE_DIR}/log") / config("LOG_FILE")
         self.log_file.parent.mkdir(exist_ok=True, parents=True)
 
         self.std_err_logger = None
         self.file_logger = None
 
-        self.format_console = config(
+        self.format_console: str = config(
             "LOG_FORMAT_CONSOLE",
             default=(
                 "<green>{time:YYYY.MM.DD HH:mm:ss}</green> | "
@@ -75,7 +77,7 @@ class MQTTLogConfig:
                 "<level>{message}</level>"
             ),
         )
-        self.format_logfile = config(
+        self.format_logfile: str = config(
             "LOG_FORMAT_FILE",
             default="{time:YYYY.MM.DD HH:mm:ss} | {level} | {module}:{thread}:{function}:{line} | <level>{message}</level>",
         )
@@ -112,11 +114,12 @@ class MQTTLogConfig:
 
 
 def check_and_close_socket():
-    logger.info("check_and_close_socket ...")
-    if Path.exists(config("SOCKET_PATH")):
+    logger.info("Check for dangling socket connections ...")
+    socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+    if Path(socket_path).exists():
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.connect(config("SOCKET_PATH"))
+            sock.connect(socket_path)
             logger.info("Socket exists and is open. Closing it.")
             sock.close()
             logger.info("Socket closed")
@@ -124,6 +127,77 @@ def check_and_close_socket():
             logger.info("Socket is already closed")
     else:
         logger.info("Socket does not exist")
+
+    Path(socket_path).unlink(missing_ok=True)
+
+
+def read_from_socket(conn, mask):
+    client_address = conn.getpeername()
+    logger.info(f"Read from socket {conn} from {client_address}")
+    data = conn.recv(1024)
+    if not data:
+        logger.info(f"Socket connection {conn} from {client_address} closed")
+        selector.unregister(conn)
+        conn.close()
+    else:
+        command = data.decode("utf-8")
+        if command == "status":
+            if monitor_thread_started.is_set():
+                conn.sendall(b"Running")
+            else:
+                conn.sendall(b"Not running")
+        else:
+            conn.sendall(b"Unknown command")
+
+
+def accept_socket_connection(sock, mask):
+    """Callback for new connections"""
+    try:
+        conn, address = sock.accept()
+        logger.info("Accepted socket connection ...")
+        conn.setblocking(False)
+
+        selector.register(conn, selectors.EVENT_READ, read_from_socket)
+    except Exception as e:
+        logger.exception(f"Error handling socket connection: {e}")
+
+
+def start_socket_listener():
+    socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+    check_and_close_socket()
+
+    retries = 0
+    while not shutdown_event.is_set() and retries < RETRY_LIMIT:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(socket_path)
+            sock.setblocking(False)
+            sock.listen(5)
+            logger.info(f"Socket listener started on {socket_path}")
+
+            selector.register(sock, selectors.EVENT_READ, accept_socket_connection)
+
+            while not shutdown_event.is_set():
+                logger.debug("Socket is waiting for events ...")
+                events = selector.select(timeout=1)  # just one second timeout to prevent blocking
+                for key, mask in events:
+                    callback = key.data
+                    callback(key.fileobj, mask)
+        except OSError as e:
+            retries += 1
+            logger.error(f"Socket error ({retries}/{RETRY_LIMIT}): {e.errno} {e.strerror}")
+            if retries >= RETRY_LIMIT:
+                logger.error("Maximum retries reached. Exiting socket listener.")
+                break
+
+            time.sleep(2**retries)  # Exponential backoff
+        finally:
+            if Path(socket_path).exists():
+                Path(socket_path).unlink(missing_ok=True)
+                logger.info(f"Socket {socket_path} cleaned up")
+
+    threading.main_thread().join()
+    logger.info("Socket listener stopped")
 
 
 def debug_mqtt_message(msg: mqtt.MQTTMessage) -> None:
@@ -148,17 +222,15 @@ def debug_mqtt_message(msg: mqtt.MQTTMessage) -> None:
     )
 
 
-def _evaluate_output_state(outputs: list) -> bool:
+def _evaluate_output_state(outputs: dict[int, dict[str, Any]], output_list: list) -> bool:
     """Helper function to evaluate output(s) state
     If any of the outputs is ON, return True
     else return False
     """
-    return any(OUTPUTS[id]["state"] == 100 for id in outputs)
+    return any(outputs[id]["state"] == 100 for id in output_list)
 
 
 def ground_floor_state(outputs: dict[int, dict[str, Any]]):
-    # global OUTPUTS
-
     logger.info(
         f"Ground Floor Actuators: ACT_ATELIER={outputs[ACT_ATELIER]['state']}; "
         f"ACT_HOL_PARTER={outputs[ACT_HOL_PARTER]['state']}; "
@@ -167,12 +239,10 @@ def ground_floor_state(outputs: dict[int, dict[str, Any]]):
         f"CMD_CT={outputs[CMD_CT]['state']}; "
     )
 
-    return _evaluate_output_state([ACT_ATELIER, ACT_HOL_PARTER, ACT_LIVING])
+    return _evaluate_output_state(outputs, [ACT_ATELIER, ACT_HOL_PARTER, ACT_LIVING])
 
 
 def upper_floor_state(outputs: dict[int, dict[str, Any]]):
-    # global OUTPUTS
-
     logger.info(
         f"Upper Floor Actuators: ACT_ETAJ_BABACI={outputs[ACT_ETAJ_BABACI]['state']}; "
         f"ACT_FLAVIA_HOL={outputs[ACT_FLAVIA_HOL]['state']}; "
@@ -180,35 +250,40 @@ def upper_floor_state(outputs: dict[int, dict[str, Any]]):
         f"CMD_CT={outputs[CMD_CT]['state']}; "
     )
 
-    return _evaluate_output_state([ACT_ETAJ_BABACI, ACT_FLAVIA_HOL])
+    return _evaluate_output_state(outputs, [ACT_ETAJ_BABACI, ACT_FLAVIA_HOL])
 
 
 def pumps_state(outputs: dict[int, dict[str, Any]]):
-    # global OUTPUTS
-
     logger.info(
         f"Pumps State: PMP_PARTER={outputs[PMP_PARTER]['state']}; "
         f"PMP_ETAJ={outputs[PMP_ETAJ]['state']}; "
         f"CMD_CT={outputs[CMD_CT]['state']}; "
     )
 
-    return _evaluate_output_state([PMP_PARTER, PMP_ETAJ])
+    return _evaluate_output_state(outputs, [PMP_PARTER, PMP_ETAJ])
 
 
 def monitor_outputs_state(client: mqtt.Client) -> None:
     pump_delay = config("PUMP_DELAY_SECONDS", cast=int)
-    while MONITOR_OUTPUTS_STATE:
-        id, outputs = output_state_queue.get()
+
+    logger.info("Monitoring outputs state started ...")
+    while not shutdown_event.is_set():
+        try:
+            id, outputs = output_state_queue.get()
+            logger.info(f"State change received for output {id}")
+        except ShutDown as ex:
+            logger.exception(ex)
+
         logger.debug("Checking outputs state ...")
         for output in outputs:
             logger.debug(outputs[output])
             if outputs[output]["state"] == 100:
-                logger.info(f"{OUTPUTS[output]['name']} is ON")
+                logger.info(f"{outputs[output]['name']} is ON")
 
         if ground_floor_state(outputs):
             """
             Here we have one of the actuators on the ground floor turned on;
-            This should turn on the pump on the ground floor (2 minutes delay)
+            This should turn on the pump on the ground floor (pump_delay)
             Should we do this in yet another thread? or just sleep for two minutes and then check one more time?
             """
             if outputs[PMP_PARTER]["state"] == 0:
@@ -244,7 +319,11 @@ def monitor_outputs_state(client: mqtt.Client) -> None:
                 client.publish(f"openmotics/output/{CMD_CT}/set", "0")
 
         output_state_queue.task_done()
-        time.sleep(10)
+        # no need to sleep since we wait on the queue to supply next message
+        # time.sleep(10)
+
+    threading.main_thread.join()
+    logger.info("Monitoring outputs state thread stopped ...")
 
 
 def on_log(client: mqtt.Client, userdata, client_log_level, messages):
@@ -261,26 +340,23 @@ def on_log(client: mqtt.Client, userdata, client_log_level, messages):
 
 
 def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties) -> None:
-    global MONITOR_OUTPUTS_STATE_THREAD_STARTED
-
     if reason_code == 0:
         logger.info("Connected successfully to the broker")
-        logger.info("Starting the check_outputs_state thread")
+        logger.info("Starting the outputs monitoring thread")
 
         # we need this check because on reconnect of the MQTT client we don't want to start a new thread
-        if MONITOR_OUTPUTS_STATE_THREAD_STARTED is False:
-            threading.Thread(target=monitor_outputs_state, args=(client,), daemon=True).start()
-            MONITOR_OUTPUTS_STATE_THREAD_STARTED = True
+        if not monitor_thread_started.is_set():
+            threading.Thread(target=monitor_outputs_state, args=(client,)).start()
+            monitor_thread_started.set()
     else:
         logger.error(f"Connection failed with code {reason_code}")
 
 
 def on_message(client: mqtt.Client, userdata: any, msg: mqtt.MQTTMessage) -> None:
-    # logger.info(f"{msg.topic}: {msg.payload.decode()}")
+    logger.debug(f"{msg.topic}: {msg.payload.decode()}")
 
     topic = msg.topic
-    if config("DEBUG", default=False, cast=bool):
-        debug_mqtt_message(msg)
+    debug_mqtt_message(msg)
 
     pattern = re.compile(r"openmotics/output/(\d+)/state")
     if not pattern.match(topic) or not topic:
@@ -298,13 +374,19 @@ def on_message(client: mqtt.Client, userdata: any, msg: mqtt.MQTTMessage) -> Non
         )
         if old_state != new_state:
             logger.info(f"Output {OUTPUTS[id]['name']} state changed from {old_state} to {new_state}")
-            output_state_queue.put((id, OUTPUTS))
+
+            try:
+                output_state_queue.put((id, OUTPUTS))
+            except ShutDown as ex:
+                logger.exception(ex)
 
 
 def run_mqtt_client(broker: str, port: int, topic: str, user: str, pwd: str):
     """Start the MQTT client."""
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="mqtt_client_zeppelin")
+    client_id = "mqtt_client_" + socket.gethostname()
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_log = on_log
@@ -315,32 +397,37 @@ def run_mqtt_client(broker: str, port: int, topic: str, user: str, pwd: str):
     client.subscribe(topic)
 
     client.loop_start()
+    # this is part of the main thread and we need to sleep some here, otherwise we just burn CPU
     try:
-        while True:
-            pass
+        while not shutdown_event.is_set():
+            time.sleep(1)
     except KeyboardInterrupt:
+        logger.warning("Received KeyboardInterrupt, stopping the MQTT client...")
+    finally:
         client.loop_stop()
         client.disconnect()
         logger.info("MQTT client disconnected")
 
 
-def program_exit(signal, frame):
-    global MONITOR_OUTPUTS_STATE
+def clear_queue(queue: Queue):
+    try:
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
+    except Exception as e:
+        logger.exception(f"Error while clearing queue: {e}")
 
-    logger.info(f"Stopping the MQTT Automation application... Received signal: {signal}")
-    logger.info("Stopping the monitor_outputs_state thread...")
-    # this stops the monitor thread
-    MONITOR_OUTPUTS_STATE = False
 
-    logger.info("Closing the socket...")
-    # close the socket
-    check_and_close_socket()
+def program_exit(signum, frame):
+    logger.info(f"Stopping the MQTT Automation application... Received signal: {signum} {signal.strsignal(signum)}")
+    logger.info("Stopping the threads ...")
 
-    logger.info("Shutting down the Queue...")
+    # this stops all threads by setting the shutdown_event
+    shutdown_event.set()
+
+    logger.info("Attempting to shut down the Queue...")
     # wait for the queue to finish, though the thread is already stopped
-    output_state_queue.join()
-
-    # TODO: close down the MQTT client
+    clear_queue(output_state_queue)
 
     logger.info("Exiting...")
     sys.exit(0)
@@ -349,12 +436,26 @@ def program_exit(signal, frame):
 @app.command()
 def stop():
     """Stop the MQTT Automation application."""
-    check_and_close_socket()
+    program_exit(signal.SIGINT, None)
+
+
+@app.command()
+def status():
+    """Get the status of the daemon."""
+    try:
+        socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)  # Timeout for socket connection
+        sock.connect(socket_path)
+        sock.sendall(b"status")
+        response = sock.recv(1024)
+        print(response.decode("utf-8"))
+    except OSError as e:
+        logger.error(f"Error connecting to socket: {e}")
 
 
 @app.command()
 def start(
-    daemonize: Annotated[bool, typer.Option(help="Run as a daemon")] = False,
     broker: Annotated[str, typer.Option(help="MQTT broker address")] = config("MQTT_HOST"),
     port: Annotated[int, typer.Option(help="MQTT broker port")] = config("MQTT_PORT"),
     topic: Annotated[str, typer.Option(help="MQTT topic to subscribe to")] = "openmotics/output/#",
@@ -365,30 +466,12 @@ def start(
     if pwd.strip() == "":
         pwd = config("MQTT_PASS")
 
-    if daemonize:
-        """Run the MQTT client as a daemon."""
-        with daemon.DaemonContext(
-            working_directory=Path.cwd(),
-            pidfile=daemon.pidfile.PIDLockFile(config("PID_FILE")),
-            # files_preserve=[config("LOG_FILE")],
-            detach_process=True,
-            stderr=sys.stderr,
-            # stdout=sys.stdout,
-            # stdout = config("LOG_FILE"),
-        ) as context:
-            context.signal_map = {
-                signal.SIGTERM: context.terminate,
-                signal.SIGINT: context.terminate,
-                signal.SIGHUP: context.terminate,
-            }
-            # called again because it opens various files and we can't have those open before going into daemon mode
-            MQTTLogConfig(daemonize).setup_logging()
-            logger.info("Running MQTT Automation in the background.")
-            run_mqtt_client(broker, port, topic, user, pwd)
-    else:
-        MQTTLogConfig().setup_logging()
-        logger.info("Running MQTT Automation in the foreground.")
-        run_mqtt_client(broker, port, topic, user, pwd)
+    MQTTLogConfig().setup_logging()
+    signal.signal(signal.SIGTERM, program_exit)
+    signal.signal(signal.SIGINT, program_exit)
+    logger.info("Running MQTT Automation")
+    threading.Thread(target=start_socket_listener).start()
+    run_mqtt_client(broker, port, topic, user, pwd)
 
 
 if __name__ == "__main__":
