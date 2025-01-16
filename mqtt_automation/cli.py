@@ -6,7 +6,7 @@ import socket
 import sys
 import threading
 import time
-from queue import Queue, ShutDown
+from queue import Queue
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -271,7 +271,7 @@ def monitor_outputs_state(client: mqtt.Client) -> None:
         try:
             id, outputs = output_state_queue.get()
             logger.info(f"State change received for output {id}")
-        except ShutDown as ex:
+        except Exception as ex:
             logger.exception(ex)
 
         logger.debug("Checking outputs state ...")
