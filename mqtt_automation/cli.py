@@ -27,14 +27,54 @@ ACT_FLAVIA_HOL = 45
 PMP_ETAJ = 47
 
 OUTPUTS = {
-    ACT_HOL_PARTER: {"name": "ACT Hol Parter", "topic": "openmotics/output/33/state", "state": 0, "timestamp": 0},
-    CMD_CT: {"name": "CMD CT", "topic": "openmotics/output/39/state", "state": 0, "timestamp": 0},
-    ACT_LIVING: {"name": "ACT Living", "topic": "openmotics/output/40/state", "state": 0, "timestamp": 0},
-    ACT_ATELIER: {"name": "ACT Atelier", "topic": "openmotics/output/42/state", "state": 0, "timestamp": 0},
-    PMP_PARTER: {"name": "PMP Parter", "topic": "openmotics/output/43/state", "state": 0, "timestamp": 0},
-    ACT_ETAJ_BABACI: {"name": "ACT Etaj Babaci", "topic": "openmotics/output/44/state", "state": 0, "timestamp": 0},
-    ACT_FLAVIA_HOL: {"name": "ACT Flavia+Hol", "topic": "openmotics/output/45/state", "state": 0, "timestamp": 0},
-    PMP_ETAJ: {"name": "PMP Etaj", "topic": "openmotics/output/47/state", "state": 0, "timestamp": 0},
+    ACT_HOL_PARTER: {
+        "name": "ACT Hol Parter",
+        "topic": "openmotics/output/33/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    CMD_CT: {
+        "name": "CMD CT",
+        "topic": "openmotics/output/39/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    ACT_LIVING: {
+        "name": "ACT Living",
+        "topic": "openmotics/output/40/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    ACT_ATELIER: {
+        "name": "ACT Atelier",
+        "topic": "openmotics/output/42/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    PMP_PARTER: {
+        "name": "PMP Parter",
+        "topic": "openmotics/output/43/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    ACT_ETAJ_BABACI: {
+        "name": "ACT Etaj Babaci",
+        "topic": "openmotics/output/44/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    ACT_FLAVIA_HOL: {
+        "name": "ACT Flavia+Hol",
+        "topic": "openmotics/output/45/state",
+        "state": 0,
+        "timestamp": 0,
+    },
+    PMP_ETAJ: {
+        "name": "PMP Etaj",
+        "topic": "openmotics/output/47/state",
+        "state": 0,
+        "timestamp": 0,
+    },
 }
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -60,26 +100,30 @@ class MQTTLogConfig:
 
     def __init__(self, daemonize: bool = False) -> None:
         self.is_daemon = daemonize
-        self.log_level_console: str = config("LOG_LEVEL_CONSOLE", default="INFO")
-        self.log_level_file: str = config("LOG_LEVEL_FILE", default="INFO")
-        self.log_file_rotation: str = config("LOG_ROTATION", default="10 MB")
-        self.log_file: Path = Path(f"{BASE_DIR}/log") / config("LOG_FILE")
+        self.log_level_console: str = str(config("LOG_LEVEL_CONSOLE", default="INFO"))
+        self.log_level_file: str = str(config("LOG_LEVEL_FILE", default="INFO"))
+        self.log_file_rotation: str = str(config("LOG_ROTATION", default="10 MB"))
+        self.log_file: Path = Path(f"{BASE_DIR}/log") / str(config("LOG_FILE"))
         self.log_file.parent.mkdir(exist_ok=True, parents=True)
 
         self.std_err_logger = None
         self.file_logger = None
 
-        self.format_console: str = config(
-            "LOG_FORMAT_CONSOLE",
-            default=(
-                "<green>{time:YYYY.MM.DD HH:mm:ss}</green> | "
-                "{level} {level.icon} | {function: >20} | "
-                "<level>{message}</level>"
-            ),
+        self.format_console: str = str(
+            config(
+                "LOG_FORMAT_CONSOLE",
+                default=(
+                    "<green>{time:YYYY.MM.DD HH:mm:ss}</green> | "
+                    "{level} {level.icon} | {function: >20} | "
+                    "<level>{message}</level>"
+                ),
+            )
         )
-        self.format_logfile: str = config(
-            "LOG_FORMAT_FILE",
-            default="{time:YYYY.MM.DD HH:mm:ss} | {level} | {module}:{thread}:{function}:{line} | <level>{message}</level>",
+        self.format_logfile: str = str(
+            config(
+                "LOG_FORMAT_FILE",
+                default="{time:YYYY.MM.DD HH:mm:ss} | {level} | {module}:{thread}:{function}:{line} | <level>{message}</level>",
+            )
         )
 
     def _setup_stderr_logger(self) -> None:
@@ -115,7 +159,7 @@ class MQTTLogConfig:
 
 def check_and_close_socket():
     logger.info("Check for dangling socket connections ...")
-    socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+    socket_path = str(config("SOCKET_PATH", default="/tmp/mqtt_automation.sock"))
     if Path(socket_path).exists():
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -163,7 +207,7 @@ def accept_socket_connection(sock, mask):
 
 
 def start_socket_listener():
-    socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+    socket_path = str(config("SOCKET_PATH", default="/tmp/mqtt_automation.sock"))
     check_and_close_socket()
 
     retries = 0
@@ -178,7 +222,7 @@ def start_socket_listener():
             selector.register(sock, selectors.EVENT_READ, accept_socket_connection)
 
             while not shutdown_event.is_set():
-                logger.debug("Socket is waiting for events ...")
+                # logger.debug("Socket is waiting for events ...")
                 events = selector.select(timeout=1)  # just one second timeout to prevent blocking
                 for key, mask in events:
                     callback = key.data
@@ -366,18 +410,20 @@ def on_message(client: mqtt.Client, userdata: any, msg: mqtt.MQTTMessage) -> Non
     id: int = payload["id"]
 
     if id in OUTPUTS:
+        logger.debug(f"id = {id} found in OUTPUTS")
         old_state = OUTPUTS[id]["state"]
         new_state = payload["value"]
         OUTPUTS[id]["state"] = new_state
         OUTPUTS[id]["timestamp"] = (
             parser.parse(payload["timestamp"]) if payload["timestamp"] is not None else payload["timestamp"]
         )
+        logger.debug(f"old_state={old_state}, new_state={new_state}")
         if old_state != new_state:
             logger.info(f"Output {OUTPUTS[id]['name']} state changed from {old_state} to {new_state}")
 
             try:
                 output_state_queue.put((id, OUTPUTS))
-            except ShutDown as ex:
+            except Exception as ex:
                 logger.exception(ex)
 
 
@@ -443,7 +489,7 @@ def stop():
 def status():
     """Get the status of the daemon."""
     try:
-        socket_path = config("SOCKET_PATH", default="/tmp/mqtt_automation.sock")
+        socket_path = str(config("SOCKET_PATH", default="/tmp/mqtt_automation.sock"))
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(5)  # Timeout for socket connection
         sock.connect(socket_path)
@@ -456,15 +502,15 @@ def status():
 
 @app.command()
 def start(
-    broker: Annotated[str, typer.Option(help="MQTT broker address")] = config("MQTT_HOST"),
-    port: Annotated[int, typer.Option(help="MQTT broker port")] = config("MQTT_PORT"),
+    broker: Annotated[str, typer.Option(help="MQTT broker address")] = str(config("MQTT_HOST")),
+    port: Annotated[int, typer.Option(help="MQTT broker port")] = int(config("MQTT_PORT")),
     topic: Annotated[str, typer.Option(help="MQTT topic to subscribe to")] = "openmotics/output/#",
-    user: Annotated[str, typer.Option(help="MQTT username")] = config("MQTT_USER"),
+    user: Annotated[str, typer.Option(help="MQTT username")] = str(config("MQTT_USER")),
     pwd: Annotated[str, typer.Option(help="MQTT password")] = "",
 ):
     """Start the MQTT Automation application."""
     if pwd.strip() == "":
-        pwd = config("MQTT_PASS")
+        pwd = str(config("MQTT_PASS"))
 
     MQTTLogConfig().setup_logging()
     signal.signal(signal.SIGTERM, program_exit)

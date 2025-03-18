@@ -16,6 +16,11 @@ python-dotenv = "^1.0.1"
 python-decouple = "^3.8"
 python-dateutil = "^2.9.0.post0"
 
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+line-length = 120
 
 [build-system]
 requires = ["poetry-core"]
