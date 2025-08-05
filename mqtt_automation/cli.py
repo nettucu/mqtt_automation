@@ -317,6 +317,7 @@ def monitor_outputs_state(client: mqtt.Client) -> None:
             logger.info(f"State change received for output {id}")
         except Exception as ex:
             logger.exception(ex)
+            continue
 
         logger.debug("Checking outputs state ...")
         for output in outputs:
